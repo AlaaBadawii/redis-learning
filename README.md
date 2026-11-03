@@ -19,6 +19,9 @@ This repository documents a backend engineer's learning path through Redis with 
 - Graceful fallback when Redis is unavailable during reads
 - JWT blocklisting by `jti` with a TTL derived from `exp`
 - Fail-closed authentication when revocation status cannot be checked
+- Sliding window rate limiting using Redis Sorted Sets (`ZSET`) and atomic multi-command pipelines
+- Pruning expired window entries and dynamic TTL assignment to prevent memory leaks
+- Configurable failure modes (fail-open vs fail-closed) during Redis downtime
 - Distinct Redis key namespaces to avoid collisions
 
 ## Repository structure
@@ -45,6 +48,9 @@ redis-learning/
 │
 ├── 05_final_challenge/
 │   └── final_challenge.py      # Counter + cache + invalidation + revocation
+│
+├── 06_rate_limiter/
+│   └── rate_limiter.py         # Sliding window rate limiter with Sorted Sets & pipeline
 │
 └── tests/
     └── test_exercises.py       # Automated validation (standard library)
@@ -144,6 +150,21 @@ python 05_final_challenge/final_challenge.py
 4. A nonexistent assessment returns `None`
 5. `revoke_token` returns `True` with a TTL near 120 seconds; an expired token returns `False`
 
+### 06 — Sliding window rate limiter
+
+```bash
+python 06_rate_limiter/rate_limiter.py
+```
+
+**Expected behavior:**
+
+- Demonstrates a rolling sliding window rate limiter backed by Redis Sorted Sets (`ZSET`).
+- Uses atomic pipeline execution (`MULTI/EXEC`) to prune expired timestamps, count active requests, record new timestamps, and refresh key TTLs.
+- Requests within the threshold return `allowed=True` with accurate `remaining` counts.
+- Excess requests return `allowed=False` without incrementing or leaking memory.
+- Requests succeed once the sliding window has elapsed.
+- Handles Redis outages with configurable failure behavior (`fail_open` vs `fail_closed`).
+
 ## Running the tests
 
 The test suite uses only the Python standard library (`unittest`) and runs against your local Redis server. It isolates its own keys and cleans up exactly what it creates — it never calls `FLUSHDB`/`FLUSHALL` and never touches unrelated keys.
@@ -167,6 +188,9 @@ python -m unittest discover -s tests -v
 | TTL-expiring blocklist entries | `04_token_blocklist/`, `05_final_challenge/` |
 | Fail-closed revocation checks | `04_token_blocklist/token_blocklist.py` |
 | Key namespacing to prevent collisions | all exercises |
+| Sliding window rate limiting with Sorted Sets (`ZSET`) | `06_rate_limiter/rate_limiter.py` |
+| Atomic transactions via pipeline (`MULTI/EXEC`) | `06_rate_limiter/rate_limiter.py` |
+| Configurable fail-open vs fail-closed strategy | `06_rate_limiter/rate_limiter.py` |
 
 ## Limitations and production considerations
 
