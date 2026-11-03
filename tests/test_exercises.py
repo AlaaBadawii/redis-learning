@@ -47,6 +47,7 @@ def dead_client() -> redis.Redis:
 cache = load_module("exercise_cache", "03_caching/cache.py")
 blocklist = load_module("exercise_blocklist", "04_token_blocklist/token_blocklist.py")
 challenge = load_module("exercise_challenge", "05_final_challenge/final_challenge.py")
+rate_limiter = load_module("exercise_rate_limiter", "06_rate_limiter/rate_limiter.py")
 
 
 def capture_stdout(func, *args, **kwargs):
@@ -129,6 +130,16 @@ class ScriptSmokeTests(unittest.TestCase):
             "duration': 45",
             "Result: None",
             "Revoke expired token: False",
+        )
+
+    def test_rate_limiter(self):
+        self.run_script(
+            "06_rate_limiter/rate_limiter.py",
+            "Sliding Window Rate Limiter Demo",
+            "Request 1: allowed=True",
+            "Request 4 (Exceeded): allowed=False",
+            "Request after window reset: allowed=True",
+            "Rate limit key TTL in Redis:",
         )
 
 
@@ -345,6 +356,118 @@ class FinalChallengeTests(unittest.TestCase):
             challenge.token_blocklist_key(str(self.assessment_id)),
         }
         self.assertEqual(len(keys), 3)
+
+
+class RateLimiterTests(unittest.TestCase):
+    def setUp(self):
+        self.identifier = f"test-client-{uuid.uuid4().hex}"
+        self.key = rate_limiter.rate_limit_key(self.identifier)
+
+    def tearDown(self):
+        rate_limiter.client.delete(self.key)
+
+    def test_requests_within_limit_are_allowed(self):
+        res1 = rate_limiter.is_rate_limited(self.identifier, limit=2, window_seconds=10)
+        self.assertTrue(res1["allowed"])
+        self.assertEqual(res1["current_requests"], 1)
+        self.assertEqual(res1["remaining"], 1)
+
+        res2 = rate_limiter.is_rate_limited(self.identifier, limit=2, window_seconds=10)
+        self.assertTrue(res2["allowed"])
+        self.assertEqual(res2["current_requests"], 2)
+        self.assertEqual(res2["remaining"], 0)
+
+    def test_exceeding_limit_is_rejected(self):
+        rate_limiter.is_rate_limited(self.identifier, limit=1, window_seconds=10)
+        res = rate_limiter.is_rate_limited(self.identifier, limit=1, window_seconds=10)
+
+        self.assertFalse(res["allowed"])
+        self.assertEqual(res["current_requests"], 1)
+        self.assertEqual(res["remaining"], 0)
+        self.assertIsNone(res["error"])
+
+    def test_sliding_window_clears_old_requests(self):
+        t0 = 1000.0
+        # Send 2 requests at t0 with limit=2, window=5s
+        res1 = rate_limiter.is_rate_limited(
+            self.identifier, limit=2, window_seconds=5, current_time=t0
+        )
+        res2 = rate_limiter.is_rate_limited(
+            self.identifier, limit=2, window_seconds=5, current_time=t0 + 1
+        )
+        self.assertTrue(res1["allowed"])
+        self.assertTrue(res2["allowed"])
+
+        # At t0 + 2, limit reached
+        res3 = rate_limiter.is_rate_limited(
+            self.identifier, limit=2, window_seconds=5, current_time=t0 + 2
+        )
+        self.assertFalse(res3["allowed"])
+
+        # At t0 + 5.1, the first request at t0 has slid out of the 5s window
+        res4 = rate_limiter.is_rate_limited(
+            self.identifier, limit=2, window_seconds=5, current_time=t0 + 5.1
+        )
+        self.assertTrue(res4["allowed"])
+        self.assertEqual(res4["current_requests"], 2)  # Request from t0+1 and t0+5.1
+
+        # At t0 + 10.0, both earlier requests have expired
+        res5 = rate_limiter.is_rate_limited(
+            self.identifier, limit=2, window_seconds=5, current_time=t0 + 12.0
+        )
+        self.assertTrue(res5["allowed"])
+        self.assertEqual(res5["current_requests"], 1)
+
+    def test_key_ttl_is_set(self):
+        rate_limiter.is_rate_limited(self.identifier, limit=5, window_seconds=10)
+        ttl = rate_limiter.client.ttl(self.key)
+        self.assertGreater(ttl, 0)
+        self.assertLessEqual(ttl, 11)
+
+    def test_invalid_parameters(self):
+        zero_limit = rate_limiter.is_rate_limited(self.identifier, limit=0, window_seconds=10)
+        self.assertFalse(zero_limit["allowed"])
+        self.assertEqual(zero_limit["error"], "Limit must be greater than zero")
+
+        zero_window = rate_limiter.is_rate_limited(self.identifier, limit=5, window_seconds=0)
+        self.assertFalse(zero_window["allowed"])
+        self.assertEqual(zero_window["error"], "Window must be greater than zero")
+
+    def test_fail_open_when_redis_unavailable(self):
+        original = rate_limiter.client
+        rate_limiter.client = dead_client()
+        try:
+            res, output = capture_stdout(
+                rate_limiter.is_rate_limited,
+                self.identifier,
+                limit=5,
+                window_seconds=10,
+                fail_closed=False,
+            )
+        finally:
+            rate_limiter.client = original
+
+        self.assertTrue(res["allowed"])
+        self.assertIn("RATE LIMITER FAIL OPEN", output)
+        self.assertIsNotNone(res["error"])
+
+    def test_fail_closed_when_redis_unavailable(self):
+        original = rate_limiter.client
+        rate_limiter.client = dead_client()
+        try:
+            res, output = capture_stdout(
+                rate_limiter.is_rate_limited,
+                self.identifier,
+                limit=5,
+                window_seconds=10,
+                fail_closed=True,
+            )
+        finally:
+            rate_limiter.client = original
+
+        self.assertFalse(res["allowed"])
+        self.assertIn("RATE LIMITER FAIL CLOSED", output)
+        self.assertIsNotNone(res["error"])
 
 
 class ExpirationTests(unittest.TestCase):
